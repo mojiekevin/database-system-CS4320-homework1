@@ -1,0 +1,166 @@
+1.(a):
+SELECT DISTINCT C.cid, C.cname
+FROM Customer C,Purchase P
+WHERE C.cid=P.cid AND C.cid NOT IN(SELECT P.cid
+	          FROM Product R,Purchase P
+	          WHERE R.pid=P.pid AND P.price>=R.msrp);
+(b):
+SELECT C.cid, R.pid
+FROM Customer C,Product R,Purchase P
+WHERE C.cid=P.cid AND R.pid=P.pid
+GROUP BY C.cid, R.pid
+HAVING COUNT(*)=3;
+(c):
+SELECT pid,MAX(price) AS price
+FROM (SELECT * FROM Product RIGHT OUTER JOIN Purchase USING(pid)) AS TEMP
+GROUP BY pid;
+(d):
+SELECT c.cid, c.cname, COUNT(pid)
+FROM Customer c,Purchase p
+WHERE p.cid = c.cid
+GROUP BY c.cid, c.cname
+Union 
+SELECT c.cid, c.cname, 0
+FROM Customer c
+WHERE not exists(
+	SELECT * 
+	FROM Purchase p
+	WHERE p.cid =  c.cid
+)
+GROUP BY c.cid,c.cname;
+(e):
+Select samequant.cid1,samequant.cid2,samenumber,overallnumber,samenumber/overallnumber JR
+from(
+Select cid1,cid2,count(*) overallnumber
+from(
+Select distinct temp1.cid cid1, temp2.cid cid2, temp1.pid pid1
+from (SELECT c1.cid ,c1.cname,p1.pid FROM Customer c1,Purchase p1 WHERE p1.cid = c1.cid) as temp1, (SELECT c2.cid ,c2.cname,p2.pid FROM Customer c2,Purchase p2 WHERE p2.cid = c2.cid) as temp2
+where temp1.cid > temp2.cid	
+group by cid1, cid2, pid1
+Union 
+Select distinct temp1.cid cid1, temp2.cid cid2, temp2.pid pid2
+from (SELECT c1.cid ,c1.cname,p1.pid FROM Customer c1,Purchase p1 WHERE p1.cid = c1.cid) as temp1, (SELECT c2.cid ,c2.cname,p2.pid FROM Customer c2,Purchase p2 WHERE p2.cid = c2.cid) as temp2
+where temp1.cid > temp2.cid	
+group by cid1, cid2, pid2
+)as temp3
+group by cid1,cid2) as overallquant,
+(Select temp3.cid1, temp3.cid2, count(*) samenumber
+from (Select distinct temp1.cid cid1,temp2.cid cid2,temp1.pid
+from (SELECT c1.cid ,c1.cname,p1.pid 
+FROM Customer c1,Purchase p1 WHERE p1.cid = c1.cid) as temp1, (SELECT c2.cid ,c2.cname,p2.pid 
+FROM Customer c2,Purchase p2 WHERE p2.cid = c2.cid) as temp2
+where temp1.cid > temp2.cid	
+and temp1.pid = temp2.pid) as temp3
+group by temp3.cid1, temp3.cid2
+)as samequant
+Where samequant.cid1 = overallquant.cid1 and
+samequant.cid2 = overallquant.cid2
+order by JR ASC
+
+3(a):
+ALTER TABLE Reserves ADD CONSTRAINT ValidDate
+CHECK(startdate + starttime < enddate + endtime 
+ 	AND EXTRACT(MINUTE FROM starttime) = 0 
+	AND EXTRACT(SECOND FROM starttime) = 0
+	AND EXTRACT(MINUTE FROM endtime) = 0
+	AND EXTRACT(SECOND FROM endtime) = 0
+);
+
+(b):
+CREATE OR REPLACE FUNCTION helper() RETURNS trigger AS $helper$
+DECLARE
+	oldBoat RECORD;
+BEGIN
+	FOR oldBoat In 
+select * from Reserves R where R.bid = NEW.bid 
+            LOOP
+    	    IF ((oldBoat.enddate + oldBoat.endtime <= NEW.enddate + NEW.endtime ) AND (oldBoat.enddate + oldBoat.endtime > NEW.startdate + NEW.starttime)) THEN 
+		RAISE EXCEPTION 'time is not right';
+	    END IF;
+
+            IF ((oldBoat.startdate + oldBoat.starttime >= NEW.startdate + NEW.starttime) AND (oldBoat.startdate + oldBoat.starttime < NEW.enddate + NEW.endtime)) THEN 
+		RAISE EXCEPTION 'time is not right';
+	    END IF;
+
+	    IF ((oldBoat.startdate + oldBoat.starttime <= NEW.startdate + NEW.starttime) AND (oldBoat.enddate + oldBoat.endtime >= NEW.enddate + NEW.endtime)) THEN 
+		RAISE EXCEPTION 'time is not right';
+	    END IF;
+	
+            END LOOP;
+
+	    RAISE NOTICE 'N0 EXCEPTION.';
+            RETURN NEW;
+END;
+$helper$ LANGUAGE plpgsql;
+
+CREATE TRIGGER helper BEFORE INSERT OR UPDATE ON Reserves
+FOR EACH ROW EXECUTE PROCEDURE helper();
+
+(c):
+CREATE OR REPLACE FUNCTION helper() RETURNS trigger AS $helper$
+DECLARE	
+	oldBoat RECORD; -- each old boat in original table
+	currStart timestamp; -- the start date of current inserted reserved boat
+	currEnd timestamp; -- the end date of current inserted reserved boat
+	currLength interval; -- the length that this boat needs to be reserved
+	minStart timestamp; -- the start date 23 hours before the current end date
+	minEnd timestamp; -- the end date of minStart
+	oldStart timestamp; -- the start date for one old boat in the original table
+	oldEnd timestamp; -- the end date for one old boat in the original table 
+	sum interval; -- calculate the accumulated hours that old users have reserved this boat. if sum > 8, raise exception at once
+BEGIN
+	currStart = NEW.startdate + NEW.starttime;
+	currEnd = NEW.enddate + NEW.endtime;
+	currLength = currEnd - currStart;
+	minStart = currStart - interval '23 hour';
+	-- if the current length > 8, raise exception at once and quit
+	
+	IF (currLength > interval '8 hour') THEN
+		RAISE EXCEPTION 'Out of time!';
+	END IF;
+	-- sum = currLength; -- initialize the sum as 0
+
+	-- traverse each window which intersects with this time region
+	LOOP
+		EXIT WHEN minStart >= currEnd;
+		-- initialize minEnd
+		minEnd = minStart + interval '24 hour';
+		-- initialize sum for every window
+		IF minEnd <= currEnd THEN
+			sum = minEnd - currStart;
+		ELSIF minStart <= currStart THEN
+			sum = currLength;
+		ELSE
+			sum = currEnd - minStart;
+		END IF;
+
+		-- traverse every old boat to calculate the hours of this boat reserved in this time region
+		FOR oldBoat IN (select * from Reserves R where R.bid = NEW.bid)
+		LOOP
+			oldStart = oldBoat.startdate + oldBoat.starttime;
+			oldEnd = oldBoat.enddate + oldBoat.endtime;
+			IF (oldStart >= minStart) AND (oldEnd <= minEnd) THEN -- old boat is totally in the window
+				sum = sum + oldEnd - oldStart;
+			ELSIF (oldStart < minStart) AND (oldEnd <= minEnd) THEN -- old boat intersects with the left part of window
+				sum = sum + oldEnd - minStart;
+			ELSIF (oldEnd > minEnd) AND (oldStart <= minEnd) THEN -- old boat intersects with the right part of window
+				sum = sum + minEnd - oldStart;
+			ELSE
+				CONTINUE;
+			END IF;
+			-- detect whether sum > 8 hours
+			IF (sum > interval '8 hour') THEN
+				RAISE EXCEPTION 'Out of time!';
+			END IF;
+		END LOOP;
+		minStart = minStart + interval '1 hour';
+	END LOOP;
+	 
+	RAISE NOTICE 'N0 EXCEPTION.';
+	RETURN NEW;
+END;
+
+$helper$ LANGUAGE plpgsql;
+
+CREATE TRIGGER helper BEFORE INSERT OR UPDATE ON Reserves
+FOR EACH ROW EXECUTE PROCEDURE helper();
